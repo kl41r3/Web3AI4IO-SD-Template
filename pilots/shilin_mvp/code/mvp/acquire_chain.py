@@ -1,9 +1,8 @@
 """Acquire and decode Pump.fun creation events.
 
-Inputs are either a versioned local fixture (the default reproducibility path)
-or an approved Solana JSON-RPC endpoint. Outputs are ``launch_events.csv`` and
-an acquisition receipt. RPC failures are recorded and raised; no fallback is
-silently substituted. The module never writes credentials to logs.
+Inputs are a local fixture or Solana JSON-RPC. Live collection tries PublicNode
+HTTPS, PublicNode HTTP/3, then the official RPC, recording each connection
+choice. Outputs are launch events and acquisition receipts.
 """
 
 from __future__ import annotations
@@ -14,6 +13,8 @@ import json
 import time
 import urllib.request
 import urllib.error
+from contextlib import contextmanager
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -23,7 +24,8 @@ from .schema import EVENT_FIELDS
 
 
 PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-DECODER_VERSION = "pumpfun-create-borsh-v1"
+DECODER_VERSION = "pumpfun-create-borsh-v2"
+CREATE_DISCRIMINATORS = {bytes((24, 30, 200, 40, 5, 28, 7, 119)), bytes((214, 144, 76, 236, 95, 139, 49, 180))}
 
 
 def _base58_decode(value: str) -> bytes:
@@ -45,19 +47,37 @@ def _read_borsh_string(data: bytes, offset: int) -> tuple[str, int]:
     return data[start:end].decode("utf-8"), end
 
 
-def decode_create_args(encoded_data: str) -> tuple[str, str, str] | None:
-    """Decode the first three Anchor/Borsh strings after an 8-byte discriminator."""
+def _base58_encode(raw: bytes) -> str:
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    number = int.from_bytes(raw, "big")
+    value = ""
+    while number:
+        number, remainder = divmod(number, 58)
+        value = alphabet[remainder] + value
+    return "1" * (len(raw) - len(raw.lstrip(b"\x00"))) + value
+
+
+def _decode_create_fields(encoded_data: str) -> tuple[str, str, str, str] | None:
+    """Read create/create_v2 arguments using the official Pump.fun IDL layout."""
     try:
         raw = _base58_decode(encoded_data)
-        if len(raw) < 8:
+        if raw[:8] not in CREATE_DISCRIMINATORS:
             return None
         offset = 8
         name, offset = _read_borsh_string(raw, offset)
         symbol, offset = _read_borsh_string(raw, offset)
-        uri, _ = _read_borsh_string(raw, offset)
-        return name, symbol, uri
+        uri, offset = _read_borsh_string(raw, offset)
+        if len(raw) < offset + 32:
+            return None
+        return name, symbol, uri, _base58_encode(raw[offset:offset + 32])
     except (UnicodeDecodeError, ValueError, OverflowError):
         return None
+
+
+def decode_create_args(encoded_data: str) -> tuple[str, str, str] | None:
+    """Return the name, symbol and metadata URI of a valid creation instruction."""
+    decoded = _decode_create_fields(encoded_data)
+    return decoded[:3] if decoded else None
 
 
 def _account_pubkey(account: Any) -> str:
@@ -80,13 +100,13 @@ def _instruction_program_id(instruction: dict[str, Any], account_keys: list[str]
 def _event_from_instruction(instruction: dict[str, Any], account_keys: list[str], program_id: str, signature: str, slot: str, block_timestamp: str, outer_index: int, inner_index: int) -> dict[str, str] | None:
     if _instruction_program_id(instruction, account_keys) != program_id:
         return None
-    decoded = decode_create_args(str(instruction.get("data", ""))) if instruction.get("data") else None
+    decoded = _decode_create_fields(str(instruction.get("data", ""))) if instruction.get("data") else None
     if decoded is None or not decoded[2]:
         return None
     accounts = instruction.get("accounts") or []
     account_values = [_account_pubkey(a) if not isinstance(a, int) else (account_keys[a] if isinstance(a, int) and a < len(account_keys) else "") for a in accounts]
     mint = account_values[0] if account_values else ""
-    creator = account_values[7] if len(account_values) > 7 else (account_values[-1] if account_values else "")
+    creator = decoded[3]
     return {
         "event_key": f"solana:{signature}:{outer_index}:{inner_index}", "network": "solana-mainnet", "platform": "pump.fun",
         "transaction_signature": signature, "slot": slot, "block_time": block_timestamp,
@@ -129,20 +149,59 @@ def decode_transaction(transaction: dict[str, Any], signature: str, block_time: 
     return events
 
 
+def rpc_method_intervals(protocol: dict[str, Any], endpoint: str) -> dict[str, float]:
+    """Read the pacing declared for the selected endpoint only."""
+    for candidate in protocol.get("api_candidates", []):
+        if candidate.get("endpoint") == endpoint:
+            return dict(candidate.get("rpc_method_min_interval_seconds") or {})
+    return {}
+
+
 class JsonRpcClient:
     """Small JSON-RPC client with explicit timeout and response accounting."""
 
-    def __init__(self, endpoint: str, timeout: float = 20.0, opener: urllib.request.OpenerDirector | None = None, min_interval: float = 0.2):
+    def __init__(self, endpoint: str, timeout: float = 20.0, opener: urllib.request.OpenerDirector | None = None, min_interval: float = 0.2, max_attempts: int = 8, method_min_intervals: dict[str, float] | None = None):
         self.endpoint = endpoint
         self.timeout = timeout
         self.opener = opener or ipv4_opener()
         self.min_interval = min_interval
+        self.method_min_intervals: dict[str, float] = {}
+        for method, interval in (method_min_intervals or {}).items():
+            from math import isfinite
+            require(not isinstance(interval, bool) and isinstance(interval, (int, float)) and isfinite(interval) and interval >= 0,
+                    f"RPC interval for {method} must be a finite nonnegative number")
+            self.method_min_intervals[method] = float(interval)
         self.calls = 0
+        self.max_attempts = max(1, int(max_attempts))
+        self.rate_delays: dict[str, float] = {}
+
+    def wait_after_rate_limit(self, method: str, headers: Any = None) -> None:
+        """Keep method-level backoff across transactions and honor Retry-After."""
+        delay = self.rate_delays.get(method, 1.0)
+        if headers:
+            retry_after = headers.get("Retry-After", "")
+            try:
+                from math import isfinite
+                numeric_delay = float(retry_after)
+                if isfinite(numeric_delay):
+                    delay = max(delay, numeric_delay)
+            except (TypeError, ValueError):
+                if retry_after:
+                    from email.utils import parsedate_to_datetime
+                    try:
+                        target = parsedate_to_datetime(retry_after)
+                        if target.tzinfo is None:
+                            target = target.replace(tzinfo=timezone.utc)
+                        delay = max(delay, (target - datetime.now(timezone.utc)).total_seconds())
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+        time.sleep(max(delay, self.method_min_intervals.get(method, self.min_interval)))
+        self.rate_delays[method] = min(self.rate_delays.get(method, 1.0) * 2, 30.0)
 
     def call(self, method: str, params: list[Any]) -> dict[str, Any]:
         delay = 1.0
         last_error: Exception | None = None
-        for _ in range(8):
+        for _ in range(self.max_attempts):
             self.calls += 1
             payload = json.dumps({"jsonrpc": "2.0", "id": self.calls, "method": method, "params": params}).encode()
             request = urllib.request.Request(self.endpoint, data=payload, headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "mvp-metadata-observer/1.0"}, method="POST")
@@ -152,7 +211,10 @@ class JsonRpcClient:
             except urllib.error.HTTPError as exc:
                 last_error = RuntimeError(f"RPC HTTP {exc.code}")
                 print(f"rpc {method} HTTP {exc.code}; retrying", flush=True)
-                if exc.code in (429, 500, 502, 503, 504):
+                if exc.code == 429:
+                    self.wait_after_rate_limit(method, exc.headers)
+                    continue
+                if exc.code in (500, 502, 503, 504):
                     time.sleep(delay)
                     delay = min(delay * 2, 30)
                     continue
@@ -171,14 +233,171 @@ class JsonRpcClient:
                 message = str(value["error"])
                 if any(token in message.lower() for token in ("429", "too many", "rate")):
                     last_error = RuntimeError(f"RPC error: {value['error']}")
-                    time.sleep(delay)
-                    delay = min(delay * 2, 30)
+                    self.wait_after_rate_limit(method)
                     continue
                 raise RuntimeError(f"RPC error: {value['error']}")
-            if self.min_interval:
-                time.sleep(self.min_interval)
+            interval = self.method_min_intervals.get(method, self.min_interval)
+            if interval:
+                time.sleep(interval)
+            self.rate_delays.pop(method, None)
             return value
         raise last_error or RuntimeError("RPC retries exhausted")
+
+
+class Http3Opener:
+    """Use a verified HTTP/3 connection through JsonRpcClient's opener interface."""
+
+    def __init__(self):
+        from curl_cffi import CurlHttpVersion, CurlOpt, requests
+        self.requests = requests
+        self.version = CurlHttpVersion.V3ONLY
+        self.session = requests.Session(trust_env=False, curl_options={CurlOpt.IPRESOLVE: 1})
+
+    @contextmanager
+    def open(self, request, timeout):
+        try:
+            response = self.session.request(request.get_method(), request.full_url,
+                data=request.data, headers=dict(request.header_items()), timeout=timeout,
+                http_version=self.version, verify=True, allow_redirects=False)
+        except self.requests.RequestsError as exc:
+            raise urllib.error.URLError(exc) from exc
+        if response.http_version != 30:
+            raise urllib.error.URLError("The requested HTTP/3 connection was unavailable")
+        if response.status_code >= 300:
+            raise urllib.error.HTTPError(request.full_url, response.status_code,
+                "RPC HTTP error", response.headers, BytesIO(response.content))
+        with BytesIO(response.content) as body:
+            yield body
+
+    def close(self):
+        self.session.close()
+
+
+class FallbackRpcClient:
+    """Try the configured connection order and keep a working route for this run."""
+
+    def __init__(self, protocol: dict[str, Any], endpoint: str | None = None,
+                 output_dir: str | Path | None = None, source_register: list[dict] | None = None,
+                 client_factory: Callable[..., Any] | None = None):
+        self.protocol = protocol
+        candidates = [dict(row) for row in protocol["api_candidates"] if row.get("access_decision") == "allowed"]
+        primary = "https://solana-rpc.publicnode.com"
+        if not endpoint or endpoint == primary:
+            # Older saved cohorts keep their sampling clock and gain the current connection order.
+            registered = protocol["api_candidates"]
+            first = next((dict(row) for row in registered if row.get("endpoint") == primary),
+                         {"candidate_id": "publicnode-solana-mainnet", "endpoint": primary})
+            first["transport"] = "https"
+            second = dict(first)
+            second.update(candidate_id="publicnode-solana-mainnet-http3", transport="http3")
+            official_url = "https://api.mainnet-beta.solana.com"
+            third = next((dict(row) for row in registered if row.get("endpoint") == official_url),
+                         {"candidate_id": "solana-official-rpc-secondary-region", "endpoint": official_url})
+            third.update(transport="https", rpc_method_min_interval_seconds={"getTransaction": 3.0})
+            candidates = [first, second, third]
+        else:
+            candidates = [row for row in candidates if row.get("endpoint") == endpoint] or [
+                {"candidate_id": "user-selected-rpc", "endpoint": endpoint, "transport": "https"}]
+        require(bool(candidates), "The protocol needs an allowed RPC connection")
+        self.routes = candidates
+        self.index = 0
+        self.client = None
+        self.selected = False
+        self.completed_calls = 0
+        self.output = Path(output_dir) if output_dir is not None else None
+        self.sources = source_register
+        self.factory = client_factory
+        self.history = []
+        if self.output:
+            self.output.mkdir(parents=True, exist_ok=True)
+            prior = self.output / "API_SELECTION.json"
+            if prior.exists():
+                self.history = list(read_json(prior).get("connection_history") or [])
+
+    @property
+    def endpoint(self):
+        return self.routes[self.index]["endpoint"]
+
+    @property
+    def calls(self):
+        return self.completed_calls + (self.client.calls if self.client else 0)
+
+    def _record(self, status: str, method: str, error: str = "") -> None:
+        route = self.routes[self.index]
+        entry = {"utc": now_utc(), "candidate_id": route["candidate_id"],
+                 "endpoint": route["endpoint"], "transport": route.get("transport", "https"),
+                 "status": status, "method": method, "error": error}
+        self.history.append(entry)
+        if not self.output:
+            return
+        with (self.output / "rpc_connection_attempts.jsonl").open("a", encoding="utf-8") as file:
+            file.write(json.dumps(entry) + "\n")
+        if status != "selected":
+            path = self.output / "API_SELECTION.json"
+            if path.exists():
+                selection = read_json(path)
+                selection["connection_history"] = self.history
+                write_json(path, selection)
+            return
+        interval = float(route.get("rpc_method_min_interval_seconds", {}).get("getTransaction", 0.2))
+        selection = {"status": "direct_collection", "connection_policy": "ordered_fallback",
+            "selected_candidate": route["candidate_id"], "selected_endpoint": route["endpoint"],
+            "transport": route.get("transport", "https"), "address_family": "ipv4",
+            "getTransaction_pause_seconds": interval, "evidence_file": "api_benchmark.csv",
+            "evidence_row": 2, "connection_order": [row["candidate_id"] for row in self.routes],
+            "connection_history": self.history}
+        write_json(self.output / "API_SELECTION.json", selection)
+        (self.output / "API_SELECTION.md").write_text(
+            "# RPC connection\n\n" + f"- Endpoint: {route['endpoint']}\n"
+            + f"- Connection: {route.get('transport', 'https')}\n"
+            + f"- Wait after a successful transaction query: {interval:g} seconds\n"
+            + "- Connection attempts: rpc_connection_attempts.jsonl\n", encoding="utf-8")
+        write_csv(self.output / "api_benchmark.csv", ["candidate_id", "endpoint", "transport", "status", "access_decision", "address_family"],
+            [{"candidate_id": route["candidate_id"], "endpoint": route["endpoint"],
+              "transport": route.get("transport", "https"), "status": "direct_collection", "access_decision": "allowed", "address_family": "ipv4"}])
+        if self.sources:
+            for row in self.sources:
+                if row.get("endpoint") == route["endpoint"]:
+                    row.update(automatic_access_decision="allowed", temporary_retention_decision="retain run receipt only",
+                               reproduction_mode="live_rerun_only", checked_at=datetime.now(timezone.utc).date().isoformat(),
+                               query_scope=f"Solana transaction queries over IPv4 using {route.get('transport', 'https')}")
+            write_csv(self.output / "source_register.csv", list(self.sources[0]), self.sources)
+
+    def call(self, method: str, params: list[Any]) -> dict[str, Any]:
+        while True:
+            route = self.routes[self.index]
+            try:
+                if self.client is None:
+                    print(f"Trying RPC: {route['endpoint']} via {route.get('transport', 'https')}", flush=True)
+                    if self.factory:
+                        self.client = self.factory(route)
+                    else:
+                        opener = Http3Opener() if route.get("transport") == "http3" else None
+                        self.client = JsonRpcClient(route["endpoint"], timeout=5, max_attempts=2, opener=opener,
+                            method_min_intervals=route.get("rpc_method_min_interval_seconds"))
+                value = self.client.call(method, params)
+            except (RuntimeError, OSError, ImportError) as exc:
+                self._record("failed", method, str(exc))
+                if self.index + 1 >= len(self.routes):
+                    raise
+                self.close()
+                if self.client:
+                    self.completed_calls += self.client.calls
+                self.client = None
+                self.selected = False
+                self.index += 1
+                print("Trying the next RPC connection.", flush=True)
+                continue
+            if not self.selected:
+                self._record("selected", method)
+                self.selected = True
+                pause = route.get("rpc_method_min_interval_seconds", {}).get("getTransaction", 0.2)
+                print(f"RPC connected via {route.get('transport', 'https')}; transaction-query pause: {pause:g}s", flush=True)
+            return value
+
+    def close(self):
+        if self.client and isinstance(self.client.opener, Http3Opener):
+            self.client.opener.close()
 
 
 def load_fixture(path: str | Path) -> list[dict[str, str]]:
@@ -263,7 +482,7 @@ def acquire_events(protocol: dict[str, Any], output_dir: str | Path, fixture: st
         stats = {"mode": "fixture", "fixture_sha256": sha256_file(fixture), "rpc_calls": 0}
     else:
         require(rpc_endpoint, "An approved RPC endpoint is required when fixture is absent")
-        client = JsonRpcClient(rpc_endpoint)
+        client = JsonRpcClient(rpc_endpoint, method_min_intervals=rpc_method_intervals(protocol, rpc_endpoint))
         events, stats = enumerate_rpc_events(client, protocol)
         stats.update({"mode": "rpc", "endpoint": rpc_endpoint})
     window_start = parse_utc(protocol["window"]["start"])

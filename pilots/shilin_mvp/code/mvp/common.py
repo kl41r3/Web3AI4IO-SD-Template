@@ -14,6 +14,7 @@ import json
 import os
 import socket
 import ssl
+import sys
 import tempfile
 import urllib.request
 from datetime import datetime, timezone
@@ -53,7 +54,14 @@ class _IPv4HTTPHandler(urllib.request.HTTPHandler):
 
 class _IPv4HTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, request):
-        return self.do_open(IPv4HTTPSConnection, request)
+        # Framework Python on macOS can use a different OpenSSL CA location
+        # from the operating system. Keep TLS verification enabled and use the
+        # system bundle when no explicit CA path was selected by the user.
+        if sys.platform == "darwin" and not os.environ.get("SSL_CERT_FILE") and not os.environ.get("SSL_CERT_DIR") and Path("/etc/ssl/cert.pem").is_file():
+            context = ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+        else:
+            context = ssl.create_default_context()
+        return self.do_open(IPv4HTTPSConnection, request, context=context)
 
 
 def _connect_ipv4(host: str, port: int, timeout: float | None) -> socket.socket:
@@ -79,8 +87,8 @@ def _connect_ipv4(host: str, port: int, timeout: float | None) -> socket.socket:
 
 
 def ipv4_opener(*handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
-    """Open HTTP(S) connections without attempting IPv6."""
-    return urllib.request.build_opener(_IPv4HTTPHandler(), _IPv4HTTPSHandler(), *handlers)
+    """Open direct IPv4 HTTP(S); the custom connector cannot tunnel via a system proxy."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _IPv4HTTPHandler(), _IPv4HTTPSHandler(), *handlers)
 
 
 def now_utc() -> str:
@@ -182,4 +190,3 @@ def stable_hash(value: object) -> str:
 
 def is_json_scalar(value: object) -> bool:
     return value is None or isinstance(value, (str, int, float, bool))
-

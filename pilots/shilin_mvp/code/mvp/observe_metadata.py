@@ -1,6 +1,8 @@
 """Observe declared metadata URIs and record every route that was actually used.
 
-``http(s)`` declarations are requested first. ``ipfs://`` and ``ar://``
+``http(s)`` declarations are checked against policy first and requested when
+allowed. A refused route gets a policy receipt without a network call.
+``ipfs://`` and ``ar://``
 references stay in the receipt as the original URI; the bytes are fetched
 through registered gateways and stored as ``request_url`` plus ``route_id``.
 Connections are IPv4-only. Public hosts may be requested without a prior
@@ -95,11 +97,12 @@ def build_observation_plan(events: list[dict[str, str]], protocol: dict[str, Any
         offsets = {str(name): int(seconds) for name, seconds in configured.items()}
     max_lateness = int(protocol["observation"]["max_lateness_seconds"])
     rows: list[dict[str, str]] = []
+    checkpoints = tuple(protocol.get("observation", {}).get("checkpoints") or REQUIRED_CHECKPOINTS)
     for event in events:
         require(event.get("block_time", "").isdigit(), f"Event lacks numeric block_time: {event['event_key']}")
         # Live cohorts pass collection start as the anchor. Fixture plans use chain time.
         chain_time = parse_utc(anchor_time) if anchor_time else __import__("datetime").datetime.fromtimestamp(int(event["block_time"]), tz=__import__("datetime").timezone.utc)
-        for checkpoint in REQUIRED_CHECKPOINTS:
+        for checkpoint in checkpoints:
             scheduled = chain_time + __import__("datetime").timedelta(seconds=offsets[checkpoint])
             scheduled_text = scheduled.isoformat(timespec="seconds").replace("+00:00", "Z")
             rows.append({"event_key": event["event_key"], "checkpoint": checkpoint, "required": "true", "scheduled_at": scheduled_text, "earliest_allowed_at": scheduled_text, "max_lateness_seconds": str(max_lateness), "protocol_version": str(protocol["protocol_version"]), "plan_status": "scheduled"})
@@ -134,7 +137,8 @@ def metadata_request_candidates(uri: str, protocol: dict[str, Any]) -> list[tupl
     """Resolve a declared metadata reference to ordered request routes.
 
     The original declaration is never replaced in the receipt. Alternate
-    gateways are extra routes used only after the earlier route can be retried.
+    gateways follow an earlier route's policy refusal or retryable request
+    failure. Nonretryable HTTP failures stop that observation.
     When a live preflight confirmed a subset of gateways, only that subset is
     used as a fallback.
     """
@@ -285,12 +289,14 @@ def observe_events(events: list[dict[str, str]], plan: list[dict[str, str]], sou
             flush()
             continue
         route_succeeded = False
-        attempt_counter = 0
+        attempt_counter = max((int(row["attempt"]) for row in attempts if row["request_id"] == request_id), default=0)
         for route_index, (request_url, route_id) in enumerate(candidates):
             allowed, _source, reason = _host_allowed(request_url, source_register)
             if not allowed:
-                if route_index == len(candidates) - 1 and not route_succeeded:
-                    attempts.append(_attempt_row(request_id, event["event_key"], planned["checkpoint"], uri, request_url, route_id, str(attempt_counter), "", "", None, "not_collected_policy", reason, "Request route was refused before any network call", "not_collected_policy"))
+                attempt_counter += 1
+                status = "not_collected_policy" if route_index == len(candidates) - 1 else "route_refused_policy"
+                attempts.append(_attempt_row(request_id, event["event_key"], planned["checkpoint"], uri, request_url, route_id, str(attempt_counter), "", "", None, status, reason, "Request route was refused before any network call", reason))
+                flush()
                 continue
             last_result: FetchResult | None = None
             for local_attempt in range(1, max_attempts + 1):

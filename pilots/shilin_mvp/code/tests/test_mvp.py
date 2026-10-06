@@ -34,10 +34,11 @@ class MvpTests(unittest.TestCase):
 
     def test_borsh_decoder(self):
         def borsh(*values):
-            raw = b"12345678"
+            raw = bytes((24, 30, 200, 40, 5, 28, 7, 119))
             for value in values:
                 data = value.encode()
                 raw += len(data).to_bytes(4, "little") + data
+            raw += bytes(range(32))
             alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
             number = int.from_bytes(raw, "big")
             encoded = ""
@@ -166,12 +167,15 @@ class MvpTests(unittest.TestCase):
             return FetchResult(status="timeout", error_class="timeout", error_message="timed out")
 
         out = self.work / "gateway"
-        observe_events([event], plan, self.sources, protocol, out, transport=transport, clock=lambda: "2026-09-28T01:00:00Z")
+        sources = [dict(row) for row in self.sources]
+        next(row for row in sources if row["host"] == "ipfs.io")["automatic_access_decision"] = "allowed"
+        observe_events([event], plan, sources, protocol, out, transport=transport, clock=lambda: "2026-09-28T01:00:00Z")
         attempts = read_csv(out / "request_attempts.csv", ATTEMPT_FIELDS)
-        self.assertEqual([row["route_id"] for row in attempts], ["pinata_gateway"])
-        self.assertEqual(attempts[0]["status"], "success")
-        self.assertEqual(attempts[0]["uri"], declared)
-        self.assertEqual(attempts[0]["request_url"], gateway)
+        self.assertEqual([row["route_id"] for row in attempts], ["declared_exact", "pinata_gateway"])
+        self.assertEqual(attempts[0]["status"], "timeout")
+        self.assertEqual(attempts[1]["status"], "success")
+        self.assertEqual(attempts[1]["uri"], declared)
+        self.assertEqual(attempts[1]["request_url"], gateway)
         snapshots = read_csv(out / "response_snapshots.csv", SNAPSHOT_FIELDS)
         self.assertEqual(snapshots[0]["uri"], declared)
         self.assertEqual(snapshots[0]["request_url"], gateway)

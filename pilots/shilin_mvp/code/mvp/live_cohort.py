@@ -1,9 +1,8 @@
-"""Rolling live cohort: T0 is the collection start, then T+24h and T+60h.
+"""Rolling live cohort: T0 is the collection start, then configured checkpoints.
 
-The process enrolls Pump.fun creates for 24 hours from the moment it starts,
-requests metadata at T0 as soon as each event is seen, then observes the same
-cohort at the end of that collection and again 36 hours later. Chain block
-time is not the observation clock.
+The process enrolls Pump.fun creates for the configured period, requests
+metadata at T0 as soon as each event is seen, then observes the same cohort
+at the configured checkpoints. Chain block time is not the observation clock.
 
 Receipts are rewritten after every enrollment batch and every checkpoint
 attempt. A later call on the same directory resumes an unfinished cohort.
@@ -17,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .acquire_chain import JsonRpcClient, decode_transaction
+from .acquire_chain import JsonRpcClient, FallbackRpcClient, decode_transaction
 from .common import now_utc, parse_utc, read_csv, read_json, stable_hash, write_csv, write_json, write_jsonl
 from .observe_metadata import observe_events
 from .schema import ATTEMPT_FIELDS, EVENT_FIELDS, PLAN_FIELDS, SNAPSHOT_FIELDS
@@ -105,9 +104,18 @@ def discover_window_events(client: JsonRpcClient, protocol: dict[str, Any], stat
             failures[str(key)] = {"count": str(_failure_count(value)), "block_time": ""}
     max_signature_retries = int(protocol.get("observation", {}).get("max_signature_retries", 5))
     page_done = {str(item) for item in (state.get("page_done") or [])}
+    transaction_budget = max(1, int(protocol.get("acquisition", {}).get("transactions_per_poll", 10)))
+    transactions_this_poll = 0
+    state["_batch_yielded"] = False
     deferred = [signature for signature, record in failures.items() if _failure_count(record) < max_signature_retries]
     for signature in deferred:
+        if transactions_this_poll >= transaction_budget:
+            state["_scan_complete"] = False
+            state["_batch_yielded"] = True
+            _checkpoint(state, failures, page_done)
+            return events
         try:
+            transactions_this_poll += 1
             transaction = client.call("getTransaction", [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}])
         except Exception as exc:
             _remember_failure(failures, signature, None)
@@ -120,6 +128,11 @@ def discover_window_events(client: JsonRpcClient, protocol: dict[str, Any], stat
         events.extend(decoded)
         _publish(state, decoded)
     _checkpoint(state, failures, page_done)
+
+    if transactions_this_poll >= transaction_budget:
+        state["_scan_complete"] = False
+        state["_batch_yielded"] = True
+        return events
 
     started_from_tip = not state.get("pending_before")
     before = state.get("pending_before") or None
@@ -150,6 +163,15 @@ def discover_window_events(client: JsonRpcClient, protocol: dict[str, Any], stat
         page_events: list[dict[str, str]] = []
         for item in page:
             signature = str(item.get("signature") or "")
+            if transactions_this_poll >= transaction_budget:
+                state["pending_before"] = previous_signature
+                state["scan_tip"] = scan_tip
+                state["_scan_complete"] = False
+                state["_batch_yielded"] = True
+                events.extend(page_events)
+                _checkpoint(state, failures, page_done)
+                return events
+            previous_signature = signature
             if not signature or signature == state.get("cursor"):
                 reached_previous = True
                 break
@@ -170,6 +192,7 @@ def discover_window_events(client: JsonRpcClient, protocol: dict[str, Any], stat
                 page_done.add(signature)
                 continue
             try:
+                transactions_this_poll += 1
                 transaction = client.call("getTransaction", [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}])
             except Exception as exc:
                 _remember_failure(failures, signature, block_time)
@@ -181,6 +204,7 @@ def discover_window_events(client: JsonRpcClient, protocol: dict[str, Any], stat
             decoded = decode_transaction(transaction, signature, int(block_time), program_id)
             page_events.extend(decoded)
             _publish(state, decoded)
+            _checkpoint(state, failures, page_done)
         events.extend(page_events)
         if reached_previous or len(page) < page_limit:
             finished = True
@@ -200,6 +224,7 @@ def discover_window_events(client: JsonRpcClient, protocol: dict[str, Any], stat
     elif before and not page_failed:
         state["pending_before"] = before
         state["scan_tip"] = scan_tip
+    state["_scan_complete"] = finished and not page_failed
     state["signature_failures"] = failures
     state["page_done"] = sorted(page_done)
     if any(_failure_count(record) >= max_signature_retries for record in failures.values()):
@@ -229,8 +254,8 @@ def _terminal_keys(attempts: list[dict[str, str]], rounds: dict[str, int], max_r
     return done
 
 
-def run_live_cohort(protocol: dict[str, Any], source_register: list[dict[str, str]], output_dir: str | Path, rpc_endpoint: str | None = None, transport: Callable[..., Any] | None = None, clock: Callable[[], str] | None = None, sleep: Callable[[float], None] | None = None, discover: Callable[..., list[dict[str, str]]] | None = None) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    """Enroll for 24 hours, keep saving, and retry failures until the 36-hour follow-up is done."""
+def run_live_cohort(protocol: dict[str, Any], source_register: list[dict[str, str]], output_dir: str | Path, rpc_endpoint: str | None = None, transport: Callable[..., Any] | None = None, clock: Callable[[], str] | None = None, sleep: Callable[[float], None] | None = None, discover: Callable[..., list[dict[str, str]]] | None = None, rpc_client: Any = None) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Enroll for the configured period and retry through the final checkpoint."""
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     clock = clock or now_utc
@@ -268,9 +293,7 @@ def run_live_cohort(protocol: dict[str, Any], source_register: list[dict[str, st
 
     client = None
     if discover is None:
-        if not rpc_endpoint:
-            raise ValueError("An RPC endpoint is required for live collection")
-        client = JsonRpcClient(rpc_endpoint)
+        client = rpc_client or FallbackRpcClient(frozen, rpc_endpoint, output.parent, source_register)
         discover = discover_window_events
     state: dict[str, Any] = {
         "cursor": saved_status.get("cursor"),
@@ -278,6 +301,7 @@ def run_live_cohort(protocol: dict[str, Any], source_register: list[dict[str, st
         "scan_tip": saved_status.get("scan_tip"),
         "page_done": list(saved_status.get("page_done") or []),
         "signature_failures": saved_status.get("signature_failures") or {},
+        "final_scan_complete": bool(saved_status.get("final_scan_complete", False)),
         "_output": str(output),
     }
     events = _load_rows(output / "launch_events.csv", EVENT_FIELDS)
@@ -303,6 +327,7 @@ def run_live_cohort(protocol: dict[str, Any], source_register: list[dict[str, st
             "scan_tip": state.get("scan_tip"),
             "page_done": list(state.get("page_done") or []),
             "signature_failures": state.get("signature_failures") or {},
+            "final_scan_complete": bool(state.get("final_scan_complete")),
             "rounds": rounds,
             "protocol_hash": stable_hash(frozen),
         })
@@ -339,17 +364,23 @@ def run_live_cohort(protocol: dict[str, Any], source_register: list[dict[str, st
         if added:
             print(f"enrolled {added} events; cohort size {len(events)}", flush=True)
             flush_events()
+            observe_due(parse_utc(clock()))
 
     state["on_events"] = accept_events
     state["on_checkpoint"] = lambda: write_status(parse_utc(clock()), "running")
     flush_events()
     while True:
         now = parse_utc(clock())
-        if now < enroll_until:
+        retryable_transactions = any(_failure_count(row) < int(frozen["observation"].get("max_signature_retries", 5)) for row in (state.get("signature_failures") or {}).values())
+        if now < enroll_until or not state["final_scan_complete"] or retryable_transactions:
             try:
+                state["_scan_complete"] = True
                 found = discover(client, frozen, state, started, enroll_until)
+                if now >= enroll_until and state.get("_scan_complete") and not state.get("pending_before"):
+                    state["final_scan_complete"] = True
             except Exception as exc:
                 print(f"discovery failed and will be retried: {exc.__class__.__name__}: {exc}", flush=True)
+                state["_scan_complete"] = False
                 found = []
             added = 0
             for event in found:
@@ -363,11 +394,18 @@ def run_live_cohort(protocol: dict[str, Any], source_register: list[dict[str, st
             if added:
                 print(f"enrolled {added} events; cohort size {len(events)}", flush=True)
                 flush_events()
+        now = parse_utc(clock())
         observe_due(now)
         flush_events()
         pending_times = []
         if now < enroll_until:
             pending_times.append(min(poll_seconds, max((enroll_until - now).total_seconds(), 0)))
+        if not state["final_scan_complete"]:
+            pending_times.append(0 if state.get("_batch_yielded") else poll_seconds)
+        elif any(_failure_count(row) < int(frozen["observation"].get("max_signature_retries", 5)) for row in (state.get("signature_failures") or {}).values()):
+            pending_times.append(poll_seconds)
+        if now < horizon:
+            pending_times.append(max((horizon - now).total_seconds(), 0))
         unfinished = [row for row in plan if (row["event_key"], row["checkpoint"]) not in done]
         for row in unfinished:
             target = parse_utc(row["scheduled_at"])

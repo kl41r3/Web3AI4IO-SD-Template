@@ -113,7 +113,7 @@ def build_coverage_ledger(plan: list[dict[str, str]], attempts: list[dict[str, s
     return ledger
 
 
-def validate_release(events: list[dict[str, str]], plan: list[dict[str, str]], attempts: list[dict[str, str]], snapshots: list[dict[str, str]], fields: list[dict[str, str]], ledger: list[dict[str, str]], bodies: list[dict[str, Any]]) -> dict[str, Any]:
+def validate_release(events: list[dict[str, str]], plan: list[dict[str, str]], attempts: list[dict[str, str]], snapshots: list[dict[str, str]], fields: list[dict[str, str]], ledger: list[dict[str, str]], bodies: list[dict[str, Any]], checkpoints: tuple[str, ...] = REQUIRED_CHECKPOINTS) -> dict[str, Any]:
     """Record schema, key, and receipt differences without stopping the release."""
     errors: list[str] = []
 
@@ -125,7 +125,7 @@ def validate_release(events: list[dict[str, str]], plan: list[dict[str, str]], a
     note(len(event_keys) == len(set(event_keys)), "Duplicate event_key")
     plan_keys = [(row["event_key"], row["checkpoint"]) for row in plan]
     note(len(plan_keys) == len(set(plan_keys)), "Duplicate observation plan key")
-    expected = {(event, checkpoint) for event in event_keys for checkpoint in REQUIRED_CHECKPOINTS}
+    expected = {(event, checkpoint) for event in event_keys for checkpoint in checkpoints}
     note(set(plan_keys) == expected, "Observation plan does not cover every required checkpoint")
     ledger_keys = {(row["event_key"], row["checkpoint"]) for row in ledger}
     note(ledger_keys == expected, "Coverage ledger does not preserve event denominator")
@@ -169,14 +169,40 @@ def build_release(run_dir: str | Path, release_dir: str | Path, protocol: dict[s
     bodies = read_jsonl(run / "response_bodies.jsonl")
     fields = parse_field_observations(events, snapshots, bodies, protocol)
     ledger = build_coverage_ledger(plan, attempts, snapshots, fields)
-    validation = validate_release(events, plan, attempts, snapshots, fields, ledger, bodies)
+    checkpoints = tuple(protocol.get("observation", {}).get("checkpoints") or REQUIRED_CHECKPOINTS)
+    validation = validate_release(events, plan, attempts, snapshots, fields, ledger, bodies, checkpoints)
+    validation["timing_state_counts"] = dict(sorted(Counter(row["timing_state"] for row in ledger).items()))
+    missing_transactions = run / "missing_transactions.jsonl"
+    if missing_transactions.exists():
+        unresolved = read_jsonl(missing_transactions)
+        if unresolved:
+            validation["errors"].append(f"{len(unresolved)} chain transactions could not be fetched after the configured retries")
+            validation["status"] = "RECORDED"
+    cohort_status = run / "cohort_status.json"
+    if cohort_status.exists():
+        status = json.loads(cohort_status.read_text())
+        if status.get("phase") != "finished" or not status.get("final_scan_complete", False):
+            validation["status"] = "INCOMPLETE"
+            validation["errors"].append("Live sampling or checkpoints are incomplete; see cohort_status.json and run_status.json")
+        if status.get("signature_failures"):
+            validation["status"] = "INCOMPLETE"
+            validation["errors"].append(f"{len(status['signature_failures'])} chain transactions remain unresolved; the event denominator may be incomplete")
     write_csv(run / "field_observations.csv", FIELD_FIELDS, fields)
     write_csv(run / "coverage_ledger.csv", LEDGER_FIELDS, ledger)
     write_json(run / "validation_results.json", {**validation, "protocol_hash": stable_hash(protocol), "created_at": now_utc()})
     published: list[dict[str, Any]] = []
     for filename in ("launch_events.csv", "observation_plan.csv", "request_attempts.csv", "request_attempts.jsonl", "response_snapshots.csv", "field_observations.csv", "coverage_ledger.csv", "validation_results.json"):
         _copy_release_file(run / filename, release, published)
-    manifest = {"release_version": str(protocol["protocol_version"]), "created_at": now_utc(), "protocol_sha256": stable_hash(protocol), "files": published, "exact_replay": [{"source": row["host"], "reproduction_mode": row.get("reproduction_mode", "excluded_from_exact_replay")} for row in source_register if row.get("reproduction_mode") in ("immutable_requery", "archived_replay")], "procedural_rerun": [{"source": row["host"], "reproduction_mode": row.get("reproduction_mode", "live_rerun_only")} for row in source_register if row.get("reproduction_mode") == "live_rerun_only"], "raw_response_policy": "Raw third-party responses are run artifacts and are excluded from release unless source rights explicitly allow redistribution."}
+    selection_file = run.parent / "API_SELECTION.json"
+    selection = read_json(selection_file) if selection_file.exists() else {}
+    selected_rpc = selection if selection.get("status") == "direct_collection" else None
+    selected_endpoint = (selected_rpc or {}).get("selected_endpoint")
+    manifest = {"release_version": str(protocol["protocol_version"]), "created_at": now_utc(), "protocol_sha256": stable_hash(protocol), "files": published,
+                "selected_rpc": selected_rpc,
+                "source_listing_scope": "Source eligibility; selected_rpc pins this invocation's chosen RPC. Metadata network requests and policy refusals are recorded in request_attempts.csv.",
+                "exact_replay": [{"source": row["host"], "reproduction_mode": row.get("reproduction_mode", "excluded_from_exact_replay")} for row in source_register if row.get("reproduction_mode") in ("immutable_requery", "archived_replay")],
+                "procedural_rerun": [{"source": row["host"], "reproduction_mode": row.get("reproduction_mode", "live_rerun_only")} for row in source_register if row.get("reproduction_mode") == "live_rerun_only" and (row.get("acquisition_method") != "Solana JSON-RPC" or row.get("endpoint") == selected_endpoint)],
+                "raw_response_policy": "Raw third-party responses are run artifacts and are excluded from release unless source rights explicitly allow redistribution."}
     write_json(release / "release_manifest.json", manifest)
     return manifest
 

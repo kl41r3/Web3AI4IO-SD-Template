@@ -31,6 +31,5 @@ LEDGER_FIELDS = [
 REQUIRED_CHECKPOINTS = ("T0", "T+24h", "T+60h")
 ALLOWED_FIELD_NAMES = ("name", "symbol", "description", "createdOn", "image", "website", "twitter", "telegram")
 ALLOWED_FIELD_TYPES = {"name": "string", "symbol": "string", "description": "string", "createdOn": "string", "image": "string", "website": "string", "twitter": "string", "telegram": "string"}
-TERMINAL_REQUEST_STATUSES = {"success", "http_error", "timeout", "transport_error", "not_collected_policy", "parse_error", "early_prohibited"}
+TERMINAL_REQUEST_STATUSES = {"success", "http_error", "timeout", "transport_error", "not_collected_policy", "route_refused_policy", "parse_error", "early_prohibited"}
 TERMINAL_LEDGER_STATES = {"observed", "request_failed", "not_collected_policy", "parse_failed", "missed", "early_prohibited"}
-

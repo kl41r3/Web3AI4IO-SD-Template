@@ -14,8 +14,16 @@
     "transaction_workers": 1
   },
   "observation": {
-    "checkpoints": ["T0", "T+24h", "T+60h"],
-    "checkpoint_offsets_seconds": {"T0": 0, "T+24h": 86400, "T+60h": 216000},
+    "checkpoints": [
+      "T0",
+      "T+24h",
+      "T+60h"
+    ],
+    "checkpoint_offsets_seconds": {
+      "T0": 0,
+      "T+24h": 86400,
+      "T+60h": 216000
+    },
     "enrollment_seconds": 86400,
     "poll_seconds": 20,
     "max_lateness_seconds": 86400,
@@ -26,7 +34,16 @@
     "max_response_bytes": 1000000
   },
   "metadata": {
-    "allowed_fields": ["name", "symbol", "description", "createdOn", "image", "website", "twitter", "telegram"],
+    "allowed_fields": [
+      "name",
+      "symbol",
+      "description",
+      "createdOn",
+      "image",
+      "website",
+      "twitter",
+      "telegram"
+    ],
     "parser_version": "metadata-json-fields-v1",
     "request_method": "GET",
     "follow_redirects": false,
@@ -53,10 +70,16 @@
     "preflight_attempts": 5,
     "preflight_sleep_seconds": 15,
     "candidates": [
-      {"host": "pump.mypinata.cloud", "template": "https://pump.mypinata.cloud/ipfs/{cid}"},
-      {"host": "gateway.pinata.cloud", "template": "https://gateway.pinata.cloud/ipfs/{cid}"}
+      {
+        "host": "pump.mypinata.cloud",
+        "template": "https://pump.mypinata.cloud/ipfs/{cid}"
+      },
+      {
+        "host": "gateway.pinata.cloud",
+        "template": "https://gateway.pinata.cloud/ipfs/{cid}"
+      }
     ],
-    "note": "The declared URI is requested first. A confirmed gateway is used only after that request fails, and only for the same IPFS CID. Preflight failure does not stop the cohort."
+    "note": "The declared route is policy-checked first. A refused route is recorded without a network call; registered same-CID gateways may then be tried. Allowed declarations are requested before gateways; only retryable request failures reach the next route. When any preflight passes, gateway candidates are restricted to the confirmed subset; when none passes, registered routes remain eligible."
   },
   "api_candidates": [
     {
@@ -66,15 +89,30 @@
       "official_docs_url": "https://www.publicnode.com/",
       "access_decision": "allowed",
       "address_family": "ipv4",
-      "selection_note": "DKUCC common CPU can reach this host over IPv4."
+      "selection_note": "First connection: the original Shilin PublicNode HTTPS client. Transaction queries wait 0.2 seconds after success.",
+      "transport": "https"
+    },
+    {
+      "candidate_id": "publicnode-solana-mainnet-http3",
+      "role": "second-chain-rpc-connection",
+      "endpoint": "https://solana-rpc.publicnode.com",
+      "official_docs_url": "https://www.publicnode.com/",
+      "access_decision": "allowed",
+      "address_family": "ipv4",
+      "selection_note": "Second connection: same PublicNode endpoint over HTTP/3. Transaction queries wait 0.2 seconds after success.",
+      "transport": "http3"
     },
     {
       "candidate_id": "solana-official-rpc-secondary-region",
-      "role": "not-used-from-dkucc",
+      "role": "third-chain-rpc-connection",
       "endpoint": "https://api.mainnet-beta.solana.com",
+      "rpc_method_min_interval_seconds": {
+        "getTransaction": 3.0
+      },
       "official_docs_url": "https://solana.com/docs/rpc",
-      "access_decision": "not_used",
-      "selection_note": "DNS answers for this host do not connect from the DKUCC common CPU partition."
+      "access_decision": "allowed",
+      "selection_note": "Third connection: official Solana RPC. getTransaction waits 3 seconds after success; other methods wait 0.2 seconds. Retry-After controls rate-limit retries.",
+      "transport": "https"
     }
   ],
   "fixture": {

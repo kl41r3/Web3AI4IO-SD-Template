@@ -10,8 +10,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .acquire_chain import JsonRpcClient, PUMPFUN_PROGRAM_ID, decode_transaction
-from .common import read_json, write_json
+from .acquire_chain import FallbackRpcClient, PUMPFUN_PROGRAM_ID, decode_transaction
+from .common import read_json, read_csv, write_json
 from .observe_metadata import HttpTransport
 
 
@@ -23,27 +23,30 @@ def main() -> None:
     parser.add_argument("--transaction-limit", type=int, default=5)
     args = parser.parse_args()
     protocol = read_json(args.protocol)
-    allowed = [row for row in protocol["api_candidates"] if row.get("access_decision") == "allowed"]
-    endpoint = str((allowed or protocol["api_candidates"])[0]["endpoint"])
+    output = Path(args.output)
+    source_path = Path(args.protocol).with_name("source_register.csv")
+    sources = read_csv(source_path) if source_path.exists() else None
     program_id = str(protocol.get("pumpfun_program_id", PUMPFUN_PROGRAM_ID))
-    client = JsonRpcClient(endpoint, timeout=15, min_interval=0.2)
+    client = FallbackRpcClient(protocol, output_dir=output, source_register=sources)
     try:
         health = client.call("getHealth", [])
     except Exception as exc:
         output = Path(args.output)
         output.mkdir(parents=True, exist_ok=True)
-        write_json(output / "smoke_result.json", {"endpoint": endpoint, "address_family": "ipv4", "error": f"{exc.__class__.__name__}: {exc}", "rpc_calls": client.calls})
+        write_json(output / "smoke_result.json", {"endpoint": client.endpoint, "address_family": "ipv4", "error": f"{exc.__class__.__name__}: {exc}", "rpc_calls": client.calls})
         print(f"smoke failed after retries: {exc}")
         print(f"wrote {output / 'smoke_result.json'}")
+        client.close()
         return
     try:
         signatures = client.call("getSignaturesForAddress", [program_id, {"limit": args.signature_limit}])
     except Exception as exc:
         output = Path(args.output)
         output.mkdir(parents=True, exist_ok=True)
-        write_json(output / "smoke_result.json", {"endpoint": endpoint, "address_family": "ipv4", "health": health.get("result"), "error": f"{exc.__class__.__name__}: {exc}", "rpc_calls": client.calls})
+        write_json(output / "smoke_result.json", {"endpoint": client.endpoint, "address_family": "ipv4", "health": health.get("result"), "error": f"{exc.__class__.__name__}: {exc}", "rpc_calls": client.calls})
         print(f"smoke failed after retries: {exc}")
         print(f"wrote {output / 'smoke_result.json'}")
+        client.close()
         return
     page = signatures.get("result") or []
     events = []
@@ -68,7 +71,7 @@ def main() -> None:
         result = HttpTransport(timeout=15)(uri)
         metadata = {"uri": uri, "status": result.status, "http_status": result.http_status, "bytes": len(result.body), "error_class": result.error_class}
     report = {
-        "endpoint": endpoint,
+        "endpoint": client.endpoint,
         "address_family": "ipv4",
         "health": health.get("result"),
         "signatures_returned": len(page),
@@ -82,12 +85,13 @@ def main() -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "smoke_result.json", report)
-    print(f"endpoint {endpoint}")
+    print(f"endpoint {client.endpoint}")
     print(f"health {report['health']}")
     print(f"signatures {report['signatures_returned']} transactions {fetched} creates {len(events)}")
     if metadata:
         print(f"metadata {metadata['status']} {metadata['http_status']} bytes {metadata['bytes']}")
     print(f"wrote {output / 'smoke_result.json'}")
+    client.close()
 
 
 if __name__ == "__main__":
